@@ -1,3 +1,225 @@
-# Ruby on rails by pythonist
+# System architecture 
+<img src="https://github.com/seomoz/SocialExplorer/raw/master/DESIGN.jpg" 
+    style="display:block" width="600"/>
+The system is designed to have three pieces.
+1. Processor: does nothing but save incoming tweets to database.
+2. Analyzer: roll-up and compile statistics. 
+3. REST API: present the statistics.
 
-[Alex Dong](http://alexdong.com/)'s notes on learning RoR
+## Processor
+
+### Components
+`Scheduler` is a long running process that will schedule processing tasks into
+resque[0].  `Processor` is a resque task that'll poll twitter to get all `mentions`
+messages[1], parse them and save the tweets into detail table. We'll specify
+`include_rts` and `include_entities` to get both @mention and retweets.
+
+The `mentions` api call will return maximum 200 tweets. Given that 
+Twitter's rate limit is 350 requests per hour [2], if we use 120 requests
+from the official @nytimes, 2 requests per minute, we're looking at maximum
+24,000 individual mentions per hour as an upper limit. 
+
+### Database
+TwitterAccounts table will store the oAuth tokens and a foreign key to the 
+SEOMoz `SSSO::User` object. The `Processor` will adjust the `run_interval`
+values based on the number of tweets we receive each time if we want to be
+really careful of using customer's rate limits. 
+
+`
+      AccountProfile {
+        :id => 892,   # FK to SSSO::User
+      }
+
+      TwitterAccounts {
+        :id => 892,   # FK to SSSO::User
+        :screen_name => 'nytimes',
+        :access_token => '...',
+        :next_run => 1768734,
+        :run_interval => 300,
+      }
+`
+
+Mentions table store information about each individual tweets. This table
+provides the "raw material" for further analysis. The `body` field is a
+MEDIUMBLOB field that will store the full json string as zlib-compressed blob
+for future purposes. The `link` field indicates whether the body contains at
+least a link in the `entities` field. 
+
+`
+      Mentions {
+        :account => 1,   #FK to TwitterAccounts
+        :tweet_id => 187182138787598, 
+        :user_id => 2178003, 
+        :timestamp => 1238771235,  
+        :has_link => true,
+        :body => '...'
+      }
+`
+
+
+## Analyzer
+
+### Components
+`Analyzer` is a resque task that'll read through each `mention` and push the
+users and links into corresponding redis SET[3]s.  When it finishes with all the
+tweets, it'll use set operations to get analytical results and store them
+into `Stats`, `Audiences` and `Clicks` tables.  The redis sets will be removed
+at the end of each run to minimize operational costs.
+
+To support drill down analysis like "show me the most retweeted links" or "show
+me the top 10 most valuable new followers who retweeted at least once",
+addtional information will need to be downloaded and stored locally. 
+`DataProfiler` is also a group of resque tasks that'll download click data from
+bit.ly, user's klout score and tweets, list of follower, etc from twitter.
+
+## Database
+`Stats` is the main table where we store the compiled statistics.
+
+`
+      Stats {
+        :account => 1,        # FK to TwitterAccounts
+        :week => 1238,        # weeks from epoch
+        :tweets => 14,
+        :retweets => 1540,
+        :followers => 21124,
+        :new_followers => 98,
+        :lost_followers => 42,
+        :engaged_followers => 13,
+        :engaged_users => 2827,
+        :links => 83,
+        :clicks => 134724,
+        :ctr => 1.28,
+      }
+
+      Audiences {
+        :account => 1,         # FK to TwitterAccounts
+        :week => 1238,
+        :followers => [2178001, 13871248, ...],
+        :engaged => [2178003, ...],
+        :retweet => [13871248, ...],
+        :new => [...],
+        :lost => [...],
+      }
+`
+
+The data fields which contain a list of user id should be delta encoded [4] 
+first, then stored as a BLOB field into MySQL. The `profiler` will be
+responsible for updating these two tables. 
+The `followers` field is downloaded by `profiler` from twitter. The `engaged,
+retweet, new, lost` will be calculated by `analyzer`.
+
+`
+      Clicks {
+        :account => 1,        # FK to TwitterAccounts
+        :week => 1238,
+        :link => 1213,
+        :clicks => 8873,
+        :users => [2178003, ...],
+      }
+`
+
+The `clicks` will be downloaded from bit.ly using `v3/clicks`[5] and `users`
+field will be populated by `analyzer`. 
+
+## Helper tables 
+Additional helper tables will be used to provide more 'profile' of the users
+and links we are tracking. The REST API will need to associate the data from
+`stats` tables with these ones to provide human readable content. 
+Corresponding `profiler` tasks will be responsible for creating these records.
+
+We'll only store user's `twitter_id` and `screen_name`. We'll use Twitter's
+`@anywhere` to dynamically load user's other profile information using
+javascript for display purpose. 
+
+`
+      Users {
+        :twitter_id => 2178003,
+        :screen_name => 'alexdong',
+        :follower => 729,
+        :following => 100,
+        :klout => 55
+      }
+
+      Domains {
+        :url => 'nytimes.com'
+      }
+
+      Links {
+        :short_url => 'http://nyti.ms/ddIkQq',
+        :url => 'http://www.nytimes.com/2010/12/07/business/media/07ebookstore.html',
+        :title => 'Google Opens Doors to E-Bookstore',
+        :domain => 773   # FK to Domains
+      }
+`
+
+# Scalability plan
+The architecture has been designed to scale horizontally. As long as MySQL is
+sharded properly, we'll only need to add new servers to scale out. 
+The front end will only need to read from `Stats, Audiences and Clicks` table
+with no join required. All the REST calls can be served by a primary key
+looking in one table. 
+
+## Data volume
+As a reference, hourly mentions for @nytimes is 200 tweets per hour. We can
+safely assume that majority of accounts won't have a mention rate higher than 5
+per hour. 
+
+Here are the rough estimations of the scale of the data we'll need to deal with. 
+
+Per account data:
+* Mentions per hour: 150
+* Poll requests to twitter per hour: 1
+* Weekly mentions: 100,800
+
+Assume we're supporting 1,000,000 accounts and each has 5 mentions per hour:
+* Mentions per second: 1,389 tweets per second.
+* Poll requests to twitter per second: 277
+* Open sockets in 5-second window: 1,385
+* Weekly mentions: 3,600,280,000
+
+## Linear growth for processes
+The different processes are all designed in a way to run independent of each
+other, so scale them out will be a matter of adding more physical boxes. 
+
+## MySQL sharding plan
+I'll ignore the tables with less than 100,000,000 records and focus on the ones
+that have the potential to grow really big. 
+* Mentions:  Another alternative is to shard by `timestamp`. Specifically,
+    shard by `UTC date` is a good enough solution.  Shard by
+    `TwitterAccount#id` seems to be the easy way to go although it does
+    introduce potential hotpots if a few super popular accounts get assigned
+    to the same server.
+* Users: Shard by `twitter_id`
+* Links: Shard by `md5(short_url)`
+
+
+# Future features
+
+## Streaming plan
+When we're ready to switch from a polling architecture to streaming one, we
+will replace `Scheduler` and `Processor` with `StreamListener` and
+`Dispatcher` without making changes to other components of the system. 
+
+The `StreamListener` will be a long running process that opens up a socket
+connection with twitter. It'll receive two types of responses: an empty new
+line which twitter uses for `keep-alive` purpose or a tweet.  The listener
+needs to implement 1) fallback protocols to accomodate disconnects from
+twitter; 2) backfilling capabilities to catch up when we have to disconnect to
+add new monitored accounts.
+
+The `Dispatcher` is another long running process that will inspect each tweet,
+lookup the @mentions it finds with the `TwitterAccounts` table and push the
+tweet into the `Mentions` table.  The listener will be connected to
+dispatchers using redis' `RPUSH/BLPOP` or `PUBLISH/SUBSCRIBE channel`.
+
+There will be `Scheduler` and `Processor` running parallel to backfill new
+accounts. The latest twitter limit is 800 mentions back into the history [1].
+
+
+[0]: https://github.com/blog/542-introducing-resque
+[1]: http://dev.twitter.com/doc/get/statuses/mentions
+[2]: http://dev.twitter.com/pages/rate-limiting
+[3]: http://code.google.com/p/redis/wiki/Sets
+[4]: http://en.wikipedia.org/wiki/Delta_encoding
+[5]: http://code.google.com/p/bitly-api/wiki/ApiDocumentation#/v3/clicks
+[6]: http://dev.twitter.com/anywhere/begin#current-user
